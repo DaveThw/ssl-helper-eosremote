@@ -1,92 +1,670 @@
 #!/bin/bash
 #
-# Usage: ./helper ....
+# Usage: ./helper newconfig|newkey|createcsr|showcsr|signcsr|update|show|expiry|help client-name
+
+# These lines taken from https://stackoverflow.com/a/1638397
+# Absolute path to this script, e.g. /home/user/pi/EosRemote/ssl/helper
+SCRIPT=$(readlink -f "$0")
+# Absolute path this script is in, thus /home/user/pi/EosRemote/ssl
+SCRIPTPATH=$(dirname "$SCRIPT")
+
+SSL_DIR="$SCRIPTPATH"
+
+CONF_FILE=-openssl.cnf
+CERT_FILE=-cert.pem
+KEY_FILE=-key.pem
+CSR_FILE=-csr.pem
+BACKUP_EXT=.bak
+
+CA_DIR="$SSL_DIR/CA"
+CA_CONF="$SSL_DIR/ca$CONF_FILE"
+CA_CERT="$SSL_DIR/ca$CERT_FILE"
+CA_KEY="$CA_DIR/private/ca$KEY_FILE"
+
+NEW_CONFIG_COMMON_NAME=$(hostname -s)
+NEW_CONFIG_LONG_HOSTNAMES=($(hostname -A))
+NEW_CONFIG_IPS=($(hostname -I))
+
+
 
 usage() {
-  echo "Usage: $0 server|CA|help [option]"
+  if [ $1 ]; then
+    echo "Usage: $0 $1 [client-name]"
+  else
+    echo "Usage: $0 [action] [client-name]"
+    echo "       $0 help [action]"
+  fi
 }
 
 help() {
   usage
   echo
-  echo "Help text"
+  #     |<-----------------------    This is 80 chars long!    ----------------------->|
+  echo "newkey client-name     Creates a new RSA key for the client"
+  echo "newconfig client-name  Creates an openssl configuration file for the client"
+  echo "createcsr client-name  Creates a CSR for the client, from the config and key"
+  echo "showcsr client-name    Show the details of the CSR for the client"
+  echo "signcsr client-name    Use the local CA to sign the CSR for the client,"
+  echo "                       creating a new certificate"
+  echo "update client-name     Creates a new certificate for the client, from the key"
+  echo "show client-name       Show the details of the client certificate"
+  echo "expiry client-name     Show the expiry date/time of the client certificate"
+  echo "help                   Show this help text"
 }
 
-server_usage() {
-  echo "Usage: $0 server newkey|update|show|enddate|help"
+
+
+file_exists() {
+  [[ -e "$1" && -s "$1" ]]
+  return $?
 }
 
-server_help() {
-  server_usage
-  echo
-  echo "server newkey   Creates a new RSA key for the server"
-  echo "server update   Creates a new certificate for the server, from the key"
-  echo "server show     Show the details of the server certificate"
-  echo "server enddate  Show the expiry date/time of the server certificate"
+backup_file() {
+  local BACKUP_DIR BACKUP
+  BACKUP_DIR=$(dirname "$1")
+  BACKUP=$(basename "$1")
+  BACKUP="$BACKUP_DIR${BACKUP_DIR:+/}${BACKUP%.*}$BACKUP_EXT"
+  echo "$BACKUP"
 }
 
-server_newkey() {
-  openssl genrsa -out server-key.pem 2048
+
+
+newconfig_usage() {
+  usage newconfig
 }
 
-server_update() {
-  echo "Create a new Certificate Request with existing Key..."
-  openssl req -new -key server-key.pem -out server-csr.pem -config server-openssl.cnf
-  echo "Use our CA to sign the Certificate Request..."
-  # -batch  prevents openssl asking if we want to sign the certificate, and commit
-  # -notext prevents the plain text details being included in the pem file
-  # -create_serial creates the serial number file if it doesn't exist
-  openssl ca -in server-csr.pem -out server-cert.pem -batch -create_serial -config ca-openssl.cnf
-  echo "...done!"
+newconfig_help() {
+  help
 }
 
-server_show() {
-  openssl x509 -in server-cert.pem -noout -text
+newconfig_client() {
+  newconfig "$SSL_DIR/$1$CONF_FILE"
 }
 
-server_enddate() {
-  local when=$(openssl x509 -in server-cert.pem -noout -enddate)
-  echo "Expiry date/time: ${when:9}"
+newconfig_ca() {
+  echo "newconfig CA - not yet functional..."
+  # newconfig "$CA_CONF"
 }
 
-server() {
-  # echo "Server"
-  case $1 in
-    update)
-      server_update
+newconfig() {
+  local YN=Y
+  echo "Config. file: $1"
+  if file_exists "$1"; then
+    # Config file exists, and is non-empty
+    local BACKUP=$(backup_file "$1")
+    if file_exists "$BACKUP"; then
+      # Backup config file exists, and is non-empty
+      #        |<-----------------------    This is 80 chars long!    ----------------------->|
+      echo    "Do you want to backup and replace the existing config file (the existing backup"
+      read -p "  file will be lost) (Y/n)? " YN
+    else
+      # Based on one of the answers here: https://stackoverflow.com/a/27875395
+      read -p "Do you want to backup and replace the existing config file (Y/n)? " YN
+    fi
+  fi
+  case ${YN:0:1} in
+    y|Y )
+      if file_exists "$1"; then
+        echo "Moving existing config file to backup: $BACKUP"
+        mv "$1" "$BACKUP"
+      fi
+      echo -n "Writing new config file..."
+      cat <<EOT > "$1"
+#
+# OpenSSL configuration file.
+# This is mostly being used for generation of certificate requests.
+#
+# Based various example configuration files, modified and tweaked
+#  by DRT for EosRemote, to use as the configuration file for generating
+#  the HTTPS certificate request
+#
+
+[req]
+default_bits		= 2048
+default_md		= sha256
+string_mask		= utf8only
+req_extensions		= req_ext
+prompt			= no
+distinguished_name	= d_name
+
+[ req_ext ]
+keyUsage		= critical, digitalSignature, keyEncipherment
+extendedKeyUsage	= serverAuth
+subjectAltName		= @alt_names
+
+[ d_name ]
+C			= UK
+#ST			= County
+#L			= City
+O			= EosRemote
+OU			= EosRemote LAN Server
+CN			= ${NEW_CONFIG_COMMON_NAME}
+
+[ alt_names ]
+#email			= eosremote@dave.thwaites.org.uk
+EOT
+      local i j=1
+      if ! [ -z "$NEW_CONFIG_COMMON_NAME" ]; then
+        echo "DNS.$((j++))			= ${NEW_CONFIG_COMMON_NAME}" >> "$1"
+      fi
+      for (( i=0; i<${#NEW_CONFIG_LONG_HOSTNAMES[@]}; i++ )); do
+        echo "DNS.$((i+j))			= ${NEW_CONFIG_LONG_HOSTNAMES[$i]}" >> "$1"
+      done
+      for (( i=0; i<${#NEW_CONFIG_IPS[@]}; i++ )); do
+        echo "IP.$((i+1))			= ${NEW_CONFIG_IPS[$i]}" >> "$1"
+      done
+      echo " done!"
+      #     |<-----------------------    This is 80 chars long!    ----------------------->|
+      echo
+      echo "Note: you should review the config file before generating your CSR, to check it"
+      echo " matches your requirements.  In particular, look at the [d_name] and"
+      echo " [alt_names] sections."
       ;;
-    newKey|newkey|new_key)
-      server_newkey
-      ;;
-    show)
-      server_show
-      ;;
-    enddate)
-      server_enddate
-      ;;
-    help)
-      server_help
-      ;;
-    *)
-      server_usage
-      exit 1
+    * )
+      echo "Cancelled"
       ;;
   esac
 }
 
-ca() {
-  echo "CA"
+
+
+newkey_usage() {
+  usage newkey
 }
 
-case $1 in
-  server)
-    server $2
+newkey_help() {
+  help
+}
+
+newkey_client() {
+  newkey "$SSL_DIR/$1$KEY_FILE"
+}
+
+newkey_ca() {
+  echo "newkey CA - not yet functional..."
+  # newkey "$CA_KEY"
+}
+
+newkey() {
+  local YN=Y
+  echo "Key file: $1"
+  if file_exists "$1"; then
+    # Key file exists, and is non-empty
+    local BACKUP=$(backup_file "$1")
+    #     |<-----------------------    This is 80 chars long!    ----------------------->|
+    echo "Warning: Replacing the existing key file will make any certificate and CSR files"
+    echo "  based on that key no longer valid - proceed with caution!"
+    if file_exists "$BACKUP"; then
+      # Backup key file exists, and is non-empty
+      #        |<-----------------------    This is 80 chars long!    ----------------------->|
+      echo    "Do you want to backup and replace the existing key file (the existing backup"
+      read -p "  file will be lost) (Y/n)? " YN
+    else
+      # Based on one of the answers here: https://stackoverflow.com/a/27875395
+      read -p "Do you want to backup and replace the existing key file (Y/n)? " YN
+    fi
+  fi
+  case ${YN:0:1} in
+    y|Y )
+      if file_exists "$1"; then
+        echo "Moving existing key file to backup: $BACKUP"
+        mv "$1" "$BACKUP"
+      fi
+      echo "Generating new key file:"
+      openssl genrsa -out "$1" 2048
+      if [ $? -eq 0 ]; then
+        echo "New key file: done!"
+      else
+        echo "New key file: failed"
+        exit 1
+      fi;
+      ;;
+    * )
+      echo "Cancelled"
+      ;;
+  esac
+}
+
+
+
+createcsr_usage() {
+  usage createcsr
+}
+
+createcsr_help() {
+  help
+}
+
+createcsr_client() {
+  createcsr "$1" "$SSL_DIR/$1$KEY_FILE" "$SSL_DIR/$1$CSR_FILE" "$SSL_DIR/$1$CONF_FILE"
+}
+
+createcsr_ca() {
+  echo "createcsr CA - not yet functional..."
+}
+
+createcsr() {
+  if ! file_exists "$2"; then
+    # Key file doesn't exist, or is empty
+    echo "Error: Key file not found!"
+    echo "(Hint: Run '$0 newkey $1' first, then try again...)"
+    exit 1
+  fi
+  if ! file_exists "$4"; then
+    # Config file doesn't exist, or is empty
+    echo "Error: Config file not found!"
+    echo "(Hint: Run '$0 newconfig $1' first, then try again...)"
+    exit 1
+  fi
+  local YN=Y
+  echo "CSR file: $3"
+  if file_exists "$3"; then
+    # CSR file exists, and is non-empty
+    local BACKUP=$(backup_file "$3")
+    if file_exists "$BACKUP"; then
+      # Backup CSR file exists, and is non-empty
+      #        |<-----------------------    This is 80 chars long!    ----------------------->|
+      echo    "Do you want to backup and replace the existing CSR file (the existing backup"
+      read -p "  file will be lost) (Y/n)? " YN
+    else
+      # Based on one of the answers here: https://stackoverflow.com/a/27875395
+      read -p "Do you want to backup and replace the existing CSR file (Y/n)? " YN
+    fi
+  fi
+  case ${YN:0:1} in
+    y|Y )
+      if file_exists "$3"; then
+        echo "Moving existing CSR file to backup: $BACKUP"
+        mv "$3" "$BACKUP"
+      fi
+      echo -n "Creating Certificate Signing Request... "
+      res=$(openssl req -new -key "$2" -out "$3" -config "$4" 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "done!"
+      else
+        echo
+        echo "$res"
+        echo "CSR creation failed"
+        exit 1
+      fi;
+      ;;
+    * )
+      echo "Cancelled"
+      ;;
+  esac
+}
+
+
+
+showcsr_usage() {
+  usage showcsr
+}
+
+showcsr_help() {
+  help
+}
+
+showcsr_client() {
+  showcsr "$SSL_DIR/$1$CSR_FILE"
+}
+
+showcsr_ca() {
+  echo "showcsr CA - not applicable..."
+}
+
+showcsr() {
+  echo "CSR file: $1"
+  if file_exists "$1"; then
+    # CSR file exists, and is not empty
+    openssl req -in "$1" -noout -text
+  else
+    echo "Error: CSR file not found!"
+    exit 1
+  fi
+}
+
+
+
+signcsr_usage() {
+  usage signcsr
+}
+
+signcsr_help() {
+  help
+}
+
+signcsr_client() {
+  signcsr "$1" "$SSL_DIR/$1$CSR_FILE" "$SSL_DIR/$1$CERT_FILE"
+}
+
+signcsr_ca() {
+  echo "signcsr CA - not yet functional..."
+}
+
+signcsr() {
+  if ! file_exists "$2"; then
+    # CSR file doesn't exist, or is empty
+    echo "Error: CSR file not found!"
+    echo "(Hint: Run '$0 createcsr $1' first, then try again...)"
+    exit 1
+  fi
+  if ! file_exists "$CA_CONF"; then
+    # CA config file doesn't exist, or is empty
+    echo "Error: Local CA not found!"
+    # echo "(Hint: Run '$0 setup CA' first, then try again...)"
+    exit 1
+  fi
+  local YN=Y
+  echo "Certificate file: $3"
+  if file_exists "$3"; then
+    # Certificate file exists, and is non-empty
+    local BACKUP=$(backup_file "$3")
+    if file_exists "$BACKUP"; then
+      # Backup Certificate file exists, and is non-empty
+      #        |<-----------------------    This is 80 chars long!    ----------------------->|
+      echo    "Do you want to backup and replace the existing Certificate file (the existing"
+      read -p "  backup file will be lost) (Y/n)? " YN
+    else
+      # Based on one of the answers here: https://stackoverflow.com/a/27875395
+      read -p "Do you want to backup and replace the existing Certificate file (Y/n)? " YN
+    fi
+  fi
+  case ${YN:0:1} in
+    y|Y )
+      if file_exists "$3"; then
+        echo "Moving existing Certificate file to backup: $BACKUP"
+        mv "$3" "$BACKUP"
+      fi
+      echo -n "Using local CA to sign the Certificate Request... "
+      # -batch  prevents openssl asking if we want to sign the certificate, and commit
+      # -notext prevents the plain text details being included in the pem file
+      # -create_serial creates the serial number file if it doesn't exist
+      res=$(openssl ca -in "$2" -out "$3" -batch -create_serial -config "$CA_CONF" 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "done!"
+      else
+        echo
+        echo "$res"
+        echo "CSR singing failed"
+        exit 1
+      fi;
+      ;;
+    * )
+      echo "Cancelled"
+      ;;
+  esac
+}
+
+
+
+update_usage() {
+  usage update
+}
+
+update_help() {
+  help
+}
+
+update_client() {
+  update "$SSL_DIR/$1$KEY_FILE" "$SSL_DIR/$1$CSR_FILE" "$SSL_DIR/$1$CONF_FILE" "$SSL_DIR/$1$CERT_FILE"
+}
+
+update_ca() {
+  echo "update CA - not yet functional..."
+}
+
+update() {
+  echo "Create a new Certificate Request with existing Key..."
+  openssl req -new -key "$1" -out "$2" -config "$3"
+  echo "Use our CA to sign the Certificate Request..."
+  # -batch  prevents openssl asking if we want to sign the certificate, and commit
+  # -notext prevents the plain text details being included in the pem file
+  # -create_serial creates the serial number file if it doesn't exist
+  openssl ca -in "$2" -out "$4" -batch -create_serial -config "$CA_CONF"
+  echo "...done!"
+}
+
+
+
+show_usage() {
+  usage show
+}
+
+show_help() {
+  help
+}
+
+show_client() {
+  show "$SSL_DIR/$1$CERT_FILE"
+}
+
+show_ca() {
+  show "$CA_CERT"
+}
+
+show() {
+  echo "Certificate file: $1"
+  if file_exists "$1"; then
+    # Certificate file exists, and is not empty
+    openssl x509 -in "$1" -noout -text
+  else
+    echo "Error: Certificate file not found!"
+    exit 1
+  fi
+}
+
+
+
+expiry_usage() {
+  usage expiry
+}
+
+expiry_help() {
+  help
+}
+
+expiry_client() {
+  expiry "$SSL_DIR/$1$CERT_FILE"
+}
+
+expiry_ca() {
+  expiry "$CA_CERT"
+}
+
+expiry() {
+  echo "Certificate file: $1"
+  if file_exists "$1"; then
+    # Certificate file exists, and is not empty
+    local when=$(openssl x509 -in "$1" -noout -enddate)
+    echo "Expiry date/time: ${when:9}"
+  else
+    echo "Error: Certificate file not found!"
+    exit 1
+  fi
+}
+
+
+
+
+case $(echo "$1" | tr "[:upper:] -." "[:lower:]_") in
+  newkey|new_key)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          newkey_ca
+          ;;
+        help)
+          newkey_help
+          ;;
+        *)
+          newkey_client "$2"
+          ;;
+      esac
+    else
+      newkey_usage
+      exit 1
+    fi
     ;;
-  CA|ca|Ca|cA)
-    ca $2
+  newconfig|new_config)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          newconfig_ca
+          ;;
+        help)
+          newconfig_help
+          ;;
+        *)
+          newconfig_client "$2"
+          ;;
+      esac
+    else
+      newconfig_usage
+      exit 1
+    fi
+    ;;
+  createcsr|create_csr)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          createcsr_ca
+          ;;
+        help)
+          createcsr_help
+          ;;
+        *)
+          createcsr_client "$2"
+          ;;
+      esac
+    else
+      createcsr_usage
+      exit 1
+    fi
+    ;;
+  showcsr|show_csr)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          showcsr_ca
+          ;;
+        help)
+          showcsr_help
+          ;;
+        *)
+          showcsr_client "$2"
+          ;;
+      esac
+    else
+      showcsr_usage
+      exit 1
+    fi
+    ;;
+  signcsr|sign_csr)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          signcsr_ca
+          ;;
+        help)
+          signcsr_help
+          ;;
+        *)
+          signcsr_client "$2"
+          ;;
+      esac
+    else
+      signcsr_usage
+      exit 1
+    fi
+    ;;
+  update)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          update_ca
+          ;;
+        help)
+          update_help
+          ;;
+        *)
+          update_client "$2"
+          ;;
+      esac
+    else
+      update_usage
+      exit 1
+    fi
+    ;;
+  show)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          show_ca
+          ;;
+        help)
+          show_help
+          ;;
+        *)
+          show_client "$2"
+          ;;
+      esac
+    else
+      show_usage
+      exit 1
+    fi
+    ;;
+  expiry|enddate|end_date)
+    if [ $# -eq 2 ]; then
+      case $(echo "$2" | tr "[:upper:]" "[:lower:]") in
+        ca)
+          expiry_ca
+          ;;
+        help)
+          expiry_help
+          ;;
+        *)
+          expiry_client "$2"
+          ;;
+      esac
+    else
+      expiry_usage
+      exit 1
+    fi
     ;;
   help)
-    help
+    case $(echo "$2" | tr "[:upper:] -." "[:lower:]_") in
+      newkey|new_key)
+        newkey_help
+        ;;
+      newconfig|new_config)
+        newconfig_help
+        ;;
+      createcsr|create_csr)
+        createcsr_help
+        ;;
+      showcsr|show_csr)
+        showcsr_help
+        ;;
+      signcsr|sign_csr)
+        signcsr_help
+        ;;
+      update)
+        update_help
+        ;;
+      show)
+        show_help
+        ;;
+      expiry|enddate)
+        expiry_help
+        ;;
+      "")
+        help
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
     ;;
   *)
     usage
